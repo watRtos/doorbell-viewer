@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Doorbell recordings</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--text:#16202a;--muted:#5b6876;--line:#d9dee4;--accent:#1f6feb;--ok:#1a7f37;--bad:#cf222e;--warn:#9a6700;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--bg:#0f141a;--card:#171e26;--text:#e6edf3;--muted:#9aa7b4;--line:#2d3742;--accent:#4c9aff;--ok:#3fb950;--bad:#f85149;--warn:#d29922}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:720px;margin:0 auto;padding:16px}h1{font-size:22px;margin:4px 0 12px}h2{font-size:16px;margin:0 0 8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+label{display:block;font-size:14px;color:var(--muted);margin:8px 0 4px}input{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);font:inherit}
+button{font:inherit;padding:10px 16px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer}
+button.secondary{background:transparent;color:var(--accent)}button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.spread{justify-content:space-between}
+.muted{color:var(--muted);font-size:14px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+ul{list-style:none;margin:0;padding:0}li{padding:10px 0;border-top:1px solid var(--line)}li:first-child{border-top:0}
+#frame{width:100%;aspect-ratio:4/3;object-fit:contain;background:#000;border-radius:8px;display:block}
+.hidden{display:none}#error{color:var(--bad);min-height:1.2em}
+</style>
+<main>
+  <h1>Doorbell recordings</h1>
+  <p id="error" role="alert"></p>
+
+  <section id="login" class="card hidden">
+    <h2>Sign in</h2>
+    <form id="loginForm">
+      <label for="email">Viewer email</label><input id="email" type="email" autocomplete="username" required>
+      <label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required>
+      <p><button type="submit">Sign in</button></p>
+    </form>
+    <p class="muted">Use the viewer login, not the doorbell's.</p>
+  </section>
+
+  <section id="app" class="hidden">
+    <div class="card">
+      <div class="row spread"><h2>Boards</h2><button id="logout" class="secondary">Sign out</button></div>
+      <p id="boards" class="muted">Checking…</p>
+      <p class="row"><button id="record">Record a clip</button><span id="recordNote" class="muted"></span></p>
+    </div>
+    <div id="player" class="card hidden">
+      <img id="frame" alt="Recorded video frame">
+      <p class="row spread"><span id="playerStatus" class="muted"></span><button id="play" disabled>Play</button></p>
+      <audio id="audio" preload="auto"></audio>
+    </div>
+    <div class="card">
+      <h2>Recordings</h2>
+      <ul id="visits"><li class="muted">Loading…</li></ul>
+    </div>
+  </section>
+</main>
+<script src="config.js"></script>
+<script>
+'use strict';
+const $ = s => document.querySelector(s);
+const cfg = window.CG2271 || {};
+const STORE = 'cg2271_viewer_session';
+let session = null, deviceId = null, refreshing = null, pollTimer = null, playback = null, recordMs = 20000;
+
+function showError(text) { $('#error').textContent = text || ''; }
+function save() { try { session ? localStorage.setItem(STORE, JSON.stringify(session)) : localStorage.removeItem(STORE); } catch {} }
+function load() { try { return JSON.parse(localStorage.getItem(STORE) || 'null'); } catch { return null; } }
+function uuid() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16)); b[6] = b[6] & 15 | 64; b[8] = b[8] & 63 | 128;
+  const h = [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+async function auth(grant, body) {
+  const r = await fetch(`${cfg.url}/auth/v1/token?grant_type=${grant}`, {
+    method: 'POST', headers: {apikey: cfg.key, 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw Error(j.msg || j.error_description || j.message || `sign-in failed (${r.status})`);
+  session = {access_token: j.access_token, refresh_token: j.refresh_token, expires_at: Date.now() / 1000 + j.expires_in};
+  save();
+}
+async function fresh() {
+  if (!session) throw Error('signed out');
+  if (session.expires_at - 60 > Date.now() / 1000) return;
+  refreshing ||= auth('refresh_token', {refresh_token: session.refresh_token}).finally(() => { refreshing = null; });
+  await refreshing; /* one refresh at a time: refresh tokens are single-use */
+}
+async function api(path, options = {}) {
+  await fresh();
+  const r = await fetch(cfg.url + path, {...options,
+    headers: {apikey: cfg.key, Authorization: `Bearer ${session.access_token}`, ...(options.headers || {})}});
+  if (r.status === 401) { signOut('Session expired; sign in again.'); throw Error('signed out'); }
+  if (!r.ok) throw Error(`${path.split('?')[0]} failed (${r.status})`);
+  return r;
+}
+async function sign(path) {
+  const r = await api(`/storage/v1/object/sign/${path}`, {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({expiresIn: 600})});
+  return `${cfg.url}/storage/v1${(await r.json()).signedURL}`;
+}
+
+function signOut(message) {
+  session = null; deviceId = null; save(); clearInterval(pollTimer); stop();
+  $('#app').classList.add('hidden'); $('#login').classList.remove('hidden'); showError(message);
+}
+async function start() {
+  $('#login').classList.add('hidden'); $('#app').classList.remove('hidden'); showError('');
+  const links = await (await api('/rest/v1/viewer_access?select=device_id&limit=1')).json();
+  if (!links.length) { showError('This login is not linked to a doorbell yet. Run seed_viewer.sql.'); return; }
+  deviceId = links[0].device_id;
+  try {
+    const c = await (await api(`/rest/v1/device_config?select=record_max_ms&device_id=eq.${deviceId}`)).json();
+    if (c.length) recordMs = c[0].record_max_ms;
+  } catch {}
+  $('#record').textContent = `Record ${Math.round(recordMs / 1000)} s`;
+  await poll(); pollTimer = setInterval(() => poll().catch(e => showError(e.message)), 3000);
+}
+
+function ago(iso) { const s = (Date.now() - Date.parse(iso)) / 1000; return s < 90 ? `${Math.round(s)} s ago` : `${Math.round(s / 60)} min ago`; }
+function half(status, path, age, who) {
+  if (status === 'complete' || status === 'truncated') return ['ok', `${who} ✓`];
+  if (status === 'recording') return ['warn', `${who} recording…`];
+  if (status === 'failed') return ['bad', `${who} failed`];
+  return age > 60 ? ['bad', `${who} did not answer`] : ['muted', `waiting for ${who}`];
+}
+async function poll() {
+  const [boards, visits] = await Promise.all([
+    api(`/rest/v1/device_status?select=board,last_seen,state&device_id=eq.${deviceId}`).then(r => r.json()),
+    api(`/rest/v1/visit?select=id,client_event_id,received_at,trigger,video_status,audio_status,video_path,audio_path,video_ms,video_frames,video_started_at,audio_started_at,audio_ms&device_id=eq.${deviceId}&order=id.desc&limit=15`).then(r => r.json())]);
+  const names = {cam: 'Camera', s2: 'Microphone'};
+  $('#boards').replaceChildren(...['cam', 's2'].map((b, i) => {
+    const row = boards.find(x => x.board === b), span = document.createElement('span');
+    const online = row && Date.now() - Date.parse(row.last_seen) < 150000;
+    span.className = online ? 'ok' : 'bad';
+    span.textContent = `${i ? ' · ' : ''}${names[b]}: ${online ? (row.state || 'online') : row ? `offline (seen ${ago(row.last_seen)})` : 'never seen'}`;
+    return span;
+  }));
+  const list = $('#visits');
+  if (!visits.length) { list.replaceChildren(Object.assign(document.createElement('li'), {className: 'muted', textContent: 'No recordings yet.'})); return; }
+  list.replaceChildren(...visits.map(v => {
+    const li = document.createElement('li'), age = (Date.now() - Date.parse(v.received_at)) / 1000;
+    const top = document.createElement('div'); top.className = 'row spread';
+    const when = document.createElement('strong'); when.textContent = new Date(v.received_at).toLocaleString();
+    top.append(when);
+    if (v.video_path || v.audio_path) {
+      const b = document.createElement('button'); b.className = 'secondary'; b.textContent = 'Open';
+      b.onclick = () => openVisit(v).catch(e => showError(e.message)); top.append(b);
+    }
+    const info = document.createElement('div'); info.className = 'muted';
+    for (const [cls, text] of [half(v.video_status, v.video_path, age, 'camera'), half(v.audio_status, v.audio_path, age, 'microphone')]) {
+      const s = document.createElement('span'); s.className = cls; s.textContent = text + '  '; info.append(s);
+    }
+    if (v.trigger !== 'viewer') info.append(` (${v.trigger})`);
+    li.append(top, info); return li;
+  }));
+}
+
+$('#record').onclick = async () => {
+  const button = $('#record'); button.disabled = true; $('#recordNote').textContent = 'Asking the boards…';
+  try {
+    await api('/rest/v1/visit', {method: 'POST', headers: {'Content-Type': 'application/json', Prefer: 'return=minimal'},
+      body: JSON.stringify({client_event_id: uuid(), device_id: deviceId, trigger: 'viewer', started_uptime_ms: 0})});
+    $('#recordNote').textContent = 'Requested. Boards poll every 2 s, record, then upload.';
+    await poll();
+  } catch (e) { showError(e.message); $('#recordNote').textContent = ''; }
+  setTimeout(() => { button.disabled = false; }, (recordMs || 20000) + 5000);
+};
+
+function splitJpeg(bytes) {
+  const frames = []; let begin = -1;
+  for (let i = 0; i + 1 < bytes.length; i++) {
+    if (bytes[i] !== 0xFF) continue;
+    if (bytes[i + 1] === 0xD8 && begin < 0) begin = i;
+    else if (bytes[i + 1] === 0xD9 && begin >= 0) { frames.push(bytes.subarray(begin, i + 2)); begin = -1; i++; }
+  }
+  return frames;
+}
+function stop() {
+  if (!playback) return;
+  cancelAnimationFrame(playback.raf); clearTimeout(playback.timer); $('#audio').pause();
+  playback.urls.forEach(u => URL.revokeObjectURL(u)); playback = null;
+}
+async function openVisit(v) {
+  stop(); showError('');
+  const status = $('#playerStatus'), play = $('#play'), audio = $('#audio'), img = $('#frame');
+  $('#player').classList.remove('hidden'); play.disabled = true; status.textContent = 'Loading…';
+  const [videoUrl, audioUrl] = await Promise.all([v.video_path && sign(v.video_path), v.audio_path && sign(v.audio_path)]);
+  let urls = [];
+  if (videoUrl) {
+    const bytes = new Uint8Array(await (await fetch(videoUrl)).arrayBuffer());
+    urls = splitJpeg(bytes).map(f => URL.createObjectURL(new Blob([f], {type: 'image/jpeg'})));
+  }
+  const frameMs = urls.length ? (v.video_ms || urls.length * 100) / urls.length : 100;
+  /* Positive offset: video started after audio. Both boards stamp SNTP wall time. */
+  const offset = v.video_started_at && v.audio_started_at ? Date.parse(v.video_started_at) - Date.parse(v.audio_started_at) : 0;
+  const videoDelay = audioUrl ? Math.max(0, offset) : 0, audioDelay = videoUrl ? Math.max(0, -offset) : 0;
+  const total = Math.max(videoDelay + urls.length * frameMs, audioUrl ? audioDelay + (v.audio_ms || 0) : 0);
+  if (audioUrl) audio.src = audioUrl;
+  if (urls.length) img.src = urls[0]; else img.removeAttribute('src');
+  playback = {urls, raf: 0, timer: 0};
+  status.textContent = `${urls.length ? `${urls.length} frames` : 'no video'} · ${audioUrl ? 'audio' : 'no audio'}` +
+    (videoUrl && audioUrl ? ` · offset ${Math.round(offset)} ms` : '');
+  play.disabled = false;
+  play.onclick = () => {
+    const t0 = performance.now(); play.disabled = true;
+    if (audioUrl) {
+      /* Start inside the tap so phones allow sound; if audio must wait, start muted and pause. */
+      audio.currentTime = 0; audio.muted = audioDelay > 0;
+      audio.play().then(() => {
+        if (!audioDelay) return;
+        audio.pause(); audio.muted = false; playback.timer = setTimeout(() => audio.play(), audioDelay);
+      }).catch(() => { status.textContent = 'Tap Play again to allow sound'; play.disabled = false; });
+    }
+    const tick = () => {
+      if (!playback) return;
+      const t = performance.now() - t0, i = Math.floor((t - videoDelay) / frameMs);
+      if (i >= 0 && i < urls.length && img.dataset.i !== String(i)) { img.src = urls[i]; img.dataset.i = i; }
+      if (t > total + 200) { play.disabled = false; return; }
+      playback.raf = requestAnimationFrame(tick);
+    };
+    tick();
+  };
+}
+
+$('#loginForm').onsubmit = async e => {
+  e.preventDefault(); showError('');
+  try { await auth('password', {email: $('#email').value, password: $('#password').value}); $('#password').value = ''; await start(); }
+  catch (err) { showError(err.message); }
+};
+$('#logout').onclick = () => signOut('');
+
+if (!cfg.url || !cfg.key) {
+  showError('Missing config.js. Open this page from the camera board (http://<camera-ip>/recordings), or on a laptop with tools/serve_viewer.py.');
+} else if ((session = load())) {
+  start().catch(e => signOut(e.message));
+} else {
+  $('#login').classList.remove('hidden');
+}
+</script>
+</html>
